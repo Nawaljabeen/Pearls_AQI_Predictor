@@ -1,0 +1,13 @@
+python-dotenv
+pandas
+numpy
+requests  
+
+hopsworks
+
+scikit-learn
+xgboost
+shap
+
+streamlit
+plotly
