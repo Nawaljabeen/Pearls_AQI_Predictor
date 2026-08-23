@@ -9,6 +9,7 @@ import os
 import pandas as pd
 from dotenv import load_dotenv
 import hopsworks
+import numpy as np
 
 from fetch_data import fetch_all_raw
 
@@ -17,7 +18,7 @@ load_dotenv()
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 
 FEATURE_GROUP_NAME = "aqi_base_lahore_fg"
-FEATURE_GROUP_VERSION = 1  # bump on real schema changes
+FEATURE_GROUP_VERSION = 3 # bump on real schema changes
 
 
 def fill_aqi_gaps(aqi_df, max_gap_hours=12):
@@ -84,19 +85,32 @@ def _shift_by_time(df, hours, col="pm25"):
 
 
 def engineer_features(df):
+   
     df = df.sort_values(["city", "timestamp"]).reset_index(drop=True)
 
-    # dropping rows where pm25 is still missing after gap-filling 
+    df = df[df["source"] == "live"].copy()
     df = df.dropna(subset=["pm25"]).copy()
 
-    # time-based features
+    # Time-based features
     df["hour"] = df["timestamp"].dt.hour
     df["day_of_week"] = df["timestamp"].dt.dayofweek
     df["month"] = df["timestamp"].dt.month
 
-    # lag / rolling / change-rate features — computed PER CITY, by actual
-    # timestamp (not row position), so gaps correctly produce NaN instead of
-    # silently pairing rows from across a missing-data desert.
+    # Cyclical time encoding
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
+    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12.0)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12.0)
+    df["dow_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7.0)
+    df["dow_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7.0)
+
+    
+    
+
+    # Optical humidity interaction features to fix sensor inflation
+    df["rh_high_flag"] = (df["relative_humidity_2m"] > 70).astype(int)
+    df["pm25_rh_interaction"] = df["pm25"] * (df["relative_humidity_2m"] / 100.0)
+
     all_frames = []
     for city, group in df.groupby("city"):
         group = group.sort_values("timestamp").reset_index(drop=True)
@@ -105,11 +119,9 @@ def engineer_features(df):
         group["pm25_lag_3h"] = _shift_by_time(group, 3, "pm25")
         group["pm25_change_rate_3h"] = group["pm25"] - group["pm25_lag_3h"]
 
-        
         roll = group["pm25"].rolling(window=3, min_periods=1).mean()
         group["pm25_roll_3h"] = roll.where(group["pm25_lag_3h"].notna() | (group.index < 3))
 
-       
         group["target_pm25_24h"] = _shift_by_time(group, -24, "pm25")
         group["target_pm25_48h"] = _shift_by_time(group, -48, "pm25")
         group["target_pm25_72h"] = _shift_by_time(group, -72, "pm25")
@@ -118,17 +130,15 @@ def engineer_features(df):
         all_frames.append(group)
 
     df = pd.concat(all_frames, ignore_index=True)
-    df = df.drop(columns=["pm25_lag_3h"])  # was only a helper for change_rate/roll guard
+    df = df.drop(columns=["pm25_lag_3h"])
 
-    # drop rows with no 24h target OR no 24h lag 
     df = df.dropna(subset=["target_pm25_24h", "pm25_lag_24h"]).copy()
 
-    
+    # Updated modern pandas bfill/ffill syntax
     narrow_fill_cols = ["pm25_roll_3h", "pm25_change_rate_3h"]
     df[narrow_fill_cols] = df.groupby("city")[narrow_fill_cols].transform(
-        lambda s: s.fillna(method="bfill", limit=2).fillna(method="ffill", limit=2)
+        lambda s: s.bfill(limit=2).ffill(limit=2)
     )
-    # anything still NaN after a narrow fill is a real remaining gap edge — drop it
     df = df.dropna(subset=narrow_fill_cols).copy()
 
     return df
@@ -158,7 +168,7 @@ def push_to_hopsworks(df):
 
 
 
-def run_feature_pipeline(start_dt, end_dt, include_dead_station=True, push=True):
+def run_feature_pipeline(start_dt, end_dt, include_dead_station=False, push=True):
     aqi_df, weather_df = fetch_all_raw(start_dt, end_dt, include_dead_station)
 
     if aqi_df.empty:

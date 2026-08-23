@@ -2,11 +2,12 @@
 pipelines/train_pipeline.py
 
 1. Fetches (features, targets) from the Hopsworks feature store.
-2. Trains + evaluates multiple models for each forecast horizon (24h/48h/72h).
-3. Picks the best model per horizon (by RMSE) and registers it in the
-   Hopsworks Model Registry.
+2. Performs TimeSeriesSplit cross-validation + Optuna hyperparameter tuning 
+   for each model across 24h, 48h, and 72h horizons.
+3. Evaluates best estimators on a held-out chronological test set.
+4. Registers the best model per horizon (by RMSE) to the Hopsworks Model Registry.
 
-Models compared: Ridge Regression (baseline), Random Forest, XGBoost.
+Models tuned: Ridge Regression, Random Forest, XGBoost.
 Metrics: RMSE, MAE, R².
 """
 
@@ -17,9 +18,11 @@ import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
 
+import optuna
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
 
 try:
     from xgboost import XGBRegressor
@@ -34,7 +37,7 @@ load_dotenv()
 
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 FEATURE_GROUP_NAME = "aqi_base_lahore_fg"
-FEATURE_GROUP_VERSION = 1
+FEATURE_GROUP_VERSION = 3
 
 MODEL_DIR = Path(__file__).parent.parent / "models"
 MODEL_DIR.mkdir(exist_ok=True)
@@ -51,16 +54,35 @@ FEATURE_COLUMNS = [
     "hour",
     "day_of_week",
     "month",
+    # Cyclical time encodings
+    "hour_sin",
+    "hour_cos",
+    "month_sin",
+    "month_cos",
+    "dow_sin",
+    "dow_cos",
+    # Derived & lag features
     "pm25_lag_24h",
     "pm25_roll_3h",
     "pm25_change_rate_3h",
+    "pm25_deviation",
+    "rh_high_flag",
+    "pm25_rh_interaction",
 ]
+
+
+
+
+# ---------------------------------------------------------------------------
+# Tuning Configuration
+# ---------------------------------------------------------------------------
+OPTUNA_TRIALS = 30  # Adjust higher (e.g., 50-100) if you have more compute time
+TS_CV_SPLITS = 3
 
 
 # ---------------------------------------------------------------------------
 # Load data
 # ---------------------------------------------------------------------------
-
 def load_features():
     print("Connecting to Hopsworks...")
     project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
@@ -75,22 +97,27 @@ def load_features():
         df = fg.read(read_options={"use_hive": True})
 
     df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    print(f"Loaded {df.shape[0]} rows")
+    df = df[df["source"] == "live"].sort_values("timestamp").reset_index(drop=True)
+
+    # Derived feature
+    df["pm25_deviation"] = df["pm25"] - df["pm25_roll_3h"]
+
+    # --- Cyclical Time Encoding ---
+    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
+    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12.0)
+    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12.0)
+    df["dow_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7.0)
+    df["dow_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7.0)
+
+    print(f"Loaded {df.shape[0]} rows (Clarity Live Only with Cyclical Encodings)")
     return df, project
 
 
 # ---------------------------------------------------------------------------
 # Chronological train/test split
 # ---------------------------------------------------------------------------
-
 def chronological_split(df, test_frac=0.15):
-    """
-    Splits by TIME, not randomly — train on the earlier ~85%, test on the
-    most recent ~15%. This mimics real deployment (predicting the future
-    from the past) and avoids leaking near-identical adjacent hours between
-    train and test, which a random split would do.
-    """
     split_idx = int(len(df) * (1 - test_frac))
     train_df = df.iloc[:split_idx].copy()
     test_df = df.iloc[split_idx:].copy()
@@ -100,35 +127,60 @@ def chronological_split(df, test_frac=0.15):
 
 
 # ---------------------------------------------------------------------------
-# Model definitions
+# Optuna Objective Function
 # ---------------------------------------------------------------------------
-
-def get_models():
-    models = {
-        "ridge": Ridge(alpha=1.0),
-        "random_forest": RandomForestRegressor(
-            n_estimators=200, max_depth=12, random_state=42, n_jobs=-1
-        ),
-    }
-    if HAS_XGBOOST:
-        models["xgboost"] = XGBRegressor(
-            n_estimators=300, max_depth=6, learning_rate=0.05,
-            random_state=42, n_jobs=-1
-        )
-    return models
+def optimize_hyperparameters(trial, model_name, X, y):
+    tscv = TimeSeriesSplit(n_splits=TS_CV_SPLITS)
+    scores = []
+    
+    for train_idx, val_idx in tscv.split(X):
+        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        if model_name == "ridge":
+            alpha = trial.suggest_float("alpha", 1e-3, 100.0, log=True)
+            model = Ridge(alpha=alpha)
+            
+        elif model_name == "random_forest":
+            n_estimators = trial.suggest_int("n_estimators", 100, 400, step=50)
+            max_depth = trial.suggest_int("max_depth", 5, 20)
+            min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
+            model = RandomForestRegressor(
+                n_estimators=n_estimators, 
+                max_depth=max_depth,
+                min_samples_split=min_samples_split,
+                random_state=42, 
+                n_jobs=-1
+            )
+            
+        elif model_name == "xgboost":
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 100, 500, step=50),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "random_state": 42,
+                "n_jobs": -1
+            }
+            model = XGBRegressor(**params)
+            
+        model.fit(X_tr, y_tr)
+        preds = model.predict(X_val)
+        rmse = np.sqrt(mean_squared_error(y_val, preds))
+        scores.append(rmse)
+        
+    return np.mean(scores)
 
 
 # ---------------------------------------------------------------------------
 # Train + evaluate for one horizon
 # ---------------------------------------------------------------------------
-
 def train_and_evaluate_horizon(df, target_col, test_frac=0.15):
     print(f"\n{'='*70}")
     print(f"HORIZON: {target_col}")
     print(f"{'='*70}")
 
-    # each horizon may have a slightly different set of valid rows
-    # (48h/72h targets can be NaN in cases 24h isn't — drop separately per horizon)
     horizon_df = df.dropna(subset=[target_col] + FEATURE_COLUMNS).copy()
     print(f"Usable rows for this horizon: {len(horizon_df)}")
 
@@ -137,22 +189,42 @@ def train_and_evaluate_horizon(df, target_col, test_frac=0.15):
     X_train, y_train = train_df[FEATURE_COLUMNS], train_df[target_col]
     X_test, y_test = test_df[FEATURE_COLUMNS], test_df[target_col]
 
-    results = {}
-    models = get_models()
+    model_architectures = ["ridge", "random_forest"]
+    if HAS_XGBOOST:
+        model_architectures.append("xgboost")
 
-    for name, model in models.items():
+    results = {}
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    for name in model_architectures:
+        print(f"\n--- Tuning {name} ---")
+        
+        study = optuna.create_study(direction="minimize")
+        study.optimize(lambda trial: optimize_hyperparameters(trial, name, X_train, y_train), n_trials=OPTUNA_TRIALS)
+        
+        print(f"Best CV RMSE for {name}: {study.best_value:.2f}")
+        print(f"Best Params: {study.best_params}")
+        
+        if name == "ridge":
+            model = Ridge(**study.best_params)
+        elif name == "random_forest":
+            model = RandomForestRegressor(**study.best_params, random_state=42, n_jobs=-1)
+        elif name == "xgboost":
+            model = XGBRegressor(**study.best_params, random_state=42, n_jobs=-1)
+            
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
-
+        
         rmse = np.sqrt(mean_squared_error(y_test, preds))
         mae = mean_absolute_error(y_test, preds)
         r2 = r2_score(y_test, preds)
-
+        
         results[name] = {"model": model, "rmse": rmse, "mae": mae, "r2": r2}
-        print(f"  {name:15s} RMSE={rmse:7.2f}  MAE={mae:7.2f}  R²={r2:.3f}")
+        print(f"[Test Set] RMSE={rmse:7.2f}  MAE={mae:7.2f}  R²={r2:.3f}")
 
     best_name = min(results, key=lambda k: results[k]["rmse"])
-    print(f"  → Best model for {target_col}: {best_name} (RMSE={results[best_name]['rmse']:.2f})")
+    print(f"\n→ Best overall model for {target_col}: {best_name} (Test RMSE={results[best_name]['rmse']:.2f})")
 
     return results, best_name, X_train, X_test, y_test
 
@@ -160,7 +232,6 @@ def train_and_evaluate_horizon(df, target_col, test_frac=0.15):
 # ---------------------------------------------------------------------------
 # Register best model to Hopsworks Model Registry
 # ---------------------------------------------------------------------------
-
 def register_model(project, model, model_name, metrics, X_sample):
     mr = project.get_model_registry()
 
@@ -180,17 +251,15 @@ def register_model(project, model, model_name, metrics, X_sample):
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
-
 def run_training(register=True):
     df, project = load_features()
-
     summary = []
 
     for target_col in HORIZONS:
         results, best_name, X_train, X_test, y_test = train_and_evaluate_horizon(df, target_col)
         best = results[best_name]
 
-        horizon_label = target_col.replace("target_pm25_", "").replace("h", "h")
+        horizon_label = target_col.replace("target_pm25_", "")
         model_name = f"aqi_lahore_{horizon_label}_{best_name}"
 
         summary.append({

@@ -13,10 +13,10 @@ from feature_pipeline import run_feature_pipeline
 
 # Earliest real data across our base stations is StateAir's 2019-05-22.
 # Set this to that date (or later, if you don't want the dead-station depth).
-BACKFILL_START = datetime(2019, 5, 22, tzinfo=timezone.utc)
+BACKFILL_START = datetime(2023, 11, 1, tzinfo=timezone.utc)
 
 
-def run_backfill(include_dead_station=True):
+def run_backfill(include_dead_station=False):
     end_dt = datetime.now(timezone.utc)
     start_dt = BACKFILL_START
 

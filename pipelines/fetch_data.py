@@ -103,7 +103,7 @@ def fetch_sensor_hourly(sensors_id, datetime_from, datetime_to, max_pages=100):
     return df
 
 
-def fetch_city_base_aqi(city_name, datetime_from, datetime_to, include_dead_station=True):
+def fetch_city_base_aqi(city_name, datetime_from, datetime_to, include_dead_station=False): # set dead stations to false because im not using stateair now
     """
     Builds one continuous PM2.5 series for a city by combining its live station
     with its dead/historical station.
@@ -256,7 +256,7 @@ def analyze_gaps(aqi_df, city_name="Lahore"):
 # Orchestrator: fetch base station
 
 
-def fetch_all_raw(start_dt, end_dt, include_dead_station=True):
+def fetch_all_raw(start_dt, end_dt, include_dead_station=False):
     """
     Returns (aqi_df, weather_df) , both long format, city column included,
     not merged the merging + feature engineering is happening in feature_pipeline.py
