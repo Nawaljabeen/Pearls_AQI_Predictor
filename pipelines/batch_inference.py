@@ -91,17 +91,14 @@ def run_inference():
     print(preds_df[["target_time", "horizon", "predicted_pm25"]].to_string(index=False))
     
     # 4. Push to Predictions Feature Group for Frontend
-    print("\nPushing predictions to Hopsworks...")
-    pred_fg = fs.get_or_create_feature_group(
-        name="aqi_predictions_lahore_fg",
-        version=1,
-        primary_key=["city", "target_time"],
-        event_time="target_time",
-        description="Daily 3-day PM2.5 forecasts for Lahore",
-    )
+    # 4. Save to Hopsworks Datasets (REST API - Firewall proof)
+    print("\nSaving predictions to Hopsworks Datasets...")
+    dataset_api = project.get_dataset_api()
     
-    pred_fg.insert(preds_df, write_options={"use_spark": False})
+    # Save locally on the runner first
+    local_path = "latest_predictions.csv"
+    preds_df.to_csv(local_path, index=False)
+    
+    # Upload to the 'Resources' folder in Hopsworks (overwrites the old one each day)
+    dataset_api.upload(local_path, "Resources", overwrite=True)
     print("✅ Inference complete and published!")
-
-if __name__ == "__main__":
-    run_inference() 
