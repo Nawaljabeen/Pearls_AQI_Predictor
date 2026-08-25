@@ -150,7 +150,7 @@ six==1.17.0
 soupsieve==2.8
 SQLAlchemy==2.0.41
 stack-data==0.6.3
-
+shap
 
 
 termcolor==3.2.0
