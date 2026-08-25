@@ -30,7 +30,7 @@ FEATURE_COLUMNS = [
     "pm25_lag_24h", "pm25_roll_3h", "pm25_change_rate_3h", "pm25_deviation",
     "rh_high_flag", "pm25_rh_interaction",
 ]
-
+MODEL_VERSION = 4
 def explain_prediction_with_shap(model, X_single):
     """
     Calculates TreeSHAP values for a single inference row and 
@@ -66,7 +66,14 @@ def run_inference():
     print("Fetching latest features...")
     fg = fs.get_feature_group(FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
     
-    df = fg.read(read_options={"use_hive": True})
+    try:
+        # Try the fast Arrow Flight read first
+        df = fg.read()
+    except Exception as e:
+        print(f"⚠️ Arrow Flight read failed ({e}), retrying with Hive fallback...")
+        # Fallback to Hive only if Arrow fails
+        df = fg.read(read_options={"use_hive": True})
+        
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     
     # Get the single most recent row for Lahore
@@ -90,9 +97,9 @@ def run_inference():
 
     for label, hours_ahead in horizons.items():
         model_name = f"aqi_lahore_{label}_xgboost"
-        print(f"Downloading model: {model_name} (Version 2)...")
+        print(f"Downloading model: {model_name} {MODEL_VERSION}")
         
-        hw_model = mr.get_model(model_name, version=3)
+        hw_model = mr.get_model(model_name, version=4)
         model_dir = hw_model.download()
         model = joblib.load(model_dir + f"/{model_name}.pkl")
 
