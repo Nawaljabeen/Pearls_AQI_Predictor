@@ -2,14 +2,16 @@
 pipelines/batch_inference.py
 
 1. Connects to Hopsworks and retrieves the latest engineered feature row.
-2. Downloads the latest registered XGBoost models for 24h, 48h, and 72h horizons.
+2. Downloads registered XGBoost models for 24h, 48h, and 72h horizons (Version 2).
 3. Generates PM2.5 predictions.
-4. Pushes the predictions to a new Hopsworks Feature Group for the Streamlit frontend.
+4. Calculates local SHAP values to extract key drivers (positive & negative impacts).
+5. Saves predictions and explainability attributes to Hopsworks Datasets (Resources/latest_predictions.csv).
 """
 
 import os
 import joblib
 import pandas as pd
+import shap
 from datetime import timedelta
 from dotenv import load_dotenv
 import hopsworks
@@ -29,6 +31,31 @@ FEATURE_COLUMNS = [
     "rh_high_flag", "pm25_rh_interaction",
 ]
 
+def explain_prediction_with_shap(model, X_single):
+    """
+    Calculates TreeSHAP values for a single inference row and 
+    extracts the top positive and negative feature drivers.
+    """
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer(X_single)
+    
+    # Extract values for the single forecast row
+    values = shap_values.values[0]
+    feature_names = X_single.columns
+    
+    # Sort features by impact magnitude
+    impacts = pd.Series(values, index=feature_names).sort_values(ascending=False)
+    
+    # Top 2 positive drivers (increasing predicted PM2.5)
+    top_positive = impacts.head(2)
+    pos_str = "; ".join([f"{col} (+{val:.1f})" for col, val in top_positive.items() if val > 0])
+    
+    # Top 2 negative drivers (decreasing predicted PM2.5)
+    top_negative = impacts.tail(2)
+    neg_str = "; ".join([f"{col} ({val:.1f})" for col, val in top_negative.items() if val < 0])
+    
+    return pos_str if pos_str else "None", neg_str if neg_str else "None"
+
 def run_inference():
     print("Connecting to Hopsworks...")
     project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
@@ -39,7 +66,6 @@ def run_inference():
     print("Fetching latest features...")
     fg = fs.get_feature_group(FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
     
-    # We only need the last few rows to ensure we get the absolute latest timestamp
     df = fg.read(read_options={"use_hive": True})
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     
@@ -49,56 +75,62 @@ def run_inference():
     if latest_data.empty:
         print("❌ No data found in feature store. Run feature pipeline first.")
         return
+
+    # Calculate missing deviation feature on the fly
     latest_data["pm25_deviation"] = latest_data["pm25"] - latest_data["pm25_roll_3h"]
+
     current_time = latest_data["timestamp"].iloc[0]
     X_predict = latest_data[FEATURE_COLUMNS]
     
     print(f"Generating forecast based on current conditions at: {current_time}")
 
-    # 2. Load Models and Predict
+    # 2. Load Models, Predict, and Calculate SHAP Values
     horizons = {"24h": 24, "48h": 48, "72h": 72}
     predictions = []
 
     for label, hours_ahead in horizons.items():
         model_name = f"aqi_lahore_{label}_xgboost"
-        print(f"Downloading model: {model_name}...")
+        print(f"Downloading model: {model_name} (Version 2)...")
         
-        # Get the latest version of the model
-        hw_model = mr.get_model(model_name, version = 2)
+        hw_model = mr.get_model(model_name, version=3)
         model_dir = hw_model.download()
         model = joblib.load(model_dir + f"/{model_name}.pkl")
 
         # Predict
         pred_pm25 = model.predict(X_predict)[0]
-        
-        # Prevent negative PM2.5 predictions (models occasionally predict slightly below 0 in extreme clean air)
-        pred_pm25 = max(0.0, pred_pm25)
+        pred_pm25 = max(0.0, float(pred_pm25))
+
+        # Calculate SHAP explainability
+        pos_drivers, neg_drivers = explain_prediction_with_shap(model, X_predict)
 
         predictions.append({
             "city": "Lahore",
             "prediction_time": current_time,
             "target_time": current_time + timedelta(hours=hours_ahead),
             "horizon": label,
-            "predicted_pm25": pred_pm25
+            "predicted_pm25": pred_pm25,
+            "top_increasing_factors": pos_drivers,
+            "top_decreasing_factors": neg_drivers
         })
 
     # 3. Format Output
     preds_df = pd.DataFrame(predictions)
     
-    print("\n" + "="*50)
-    print("FORECAST RESULTS")
-    print("="*50)
-    print(preds_df[["target_time", "horizon", "predicted_pm25"]].to_string(index=False))
+    print("\n" + "="*75)
+    print("FORECAST RESULTS WITH LOCAL SHAP EXPLANATIONS")
+    print("="*75)
+    print(preds_df[["target_time", "horizon", "predicted_pm25", "top_increasing_factors"]].to_string(index=False))
     
-    # 4. Push to Predictions Feature Group for Frontend
-    # 4. Save to Hopsworks Datasets (REST API - Firewall proof)
-    print("\nSaving predictions to Hopsworks Datasets...")
+    # 4. Save to Hopsworks Datasets (REST API)
+    print("\nSaving predictions and SHAP explanations to Hopsworks Datasets...")
     dataset_api = project.get_dataset_api()
     
-    # Save locally on the runner first
     local_path = "latest_predictions.csv"
     preds_df.to_csv(local_path, index=False)
     
-    # Upload to the 'Resources' folder in Hopsworks (overwrites the old one each day)
+    # Upload to the 'Resources' folder in Hopsworks (overwrites previous daily file)
     dataset_api.upload(local_path, "Resources", overwrite=True)
-    print("✅ Inference complete and published!")
+    print("✅ Inference complete and published to Hopsworks Datasets!")
+
+if __name__ == "__main__":
+    run_inference()
