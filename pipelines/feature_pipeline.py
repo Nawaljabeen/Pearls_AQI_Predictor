@@ -132,7 +132,7 @@ def engineer_features(df):
     df = pd.concat(all_frames, ignore_index=True)
     df = df.drop(columns=["pm25_lag_3h"])
 
-    df = df.dropna(subset=["target_pm25_24h", "pm25_lag_24h"]).copy()
+    df = df.dropna(subset=[ "pm25_lag_24h"]).copy()
 
     # Updated modern pandas bfill/ffill syntax
     narrow_fill_cols = ["pm25_roll_3h", "pm25_change_rate_3h"]
