@@ -24,10 +24,8 @@ if (APP_DIR / "assets").exists():
 else:
     ASSETS_DIR = ROOT_DIR / "assets"
 
-CSV_PATH = ROOT_DIR / "sector_map_predictions.csv"
-
 # ---------------------------------------------------------------------------
-# Page Configuration & Global CSS Styling (Solid Pastel Pink Vibe)
+# Page Configuration & Global CSS Styling
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Lahore Spatial AQI Forecast",
@@ -47,7 +45,6 @@ st.markdown("""
         background-color: #FAF8F5;
     }
     
-    /* Center align radio buttons + their label, ensure text is fully visible, no borders */
     div[data-testid="stRadio"] {
         text-align: center;
     }
@@ -74,14 +71,12 @@ st.markdown("""
         opacity: 1 !important;
         background-color: transparent !important;
     }
-    /* Ring: no fill, no border, just a soft neutral shadow for depth */
     div[data-testid="stRadio"] label > div:first-child,
     div[data-testid="stRadio"] label [data-baseweb="radio"] {
         background-color: transparent !important;
         border: none !important;
         box-shadow: none !important;
     }
-    /* Dot: plain white/unfilled by default — only the CHECKED option gets a solid fill */
     div[data-testid="stRadio"] label > div:first-child > div,
     div[data-testid="stRadio"] label [data-baseweb="radio"] > div {
         background-color: #FFFFFF !important;
@@ -102,7 +97,6 @@ st.markdown("""
         background-color: transparent !important;
     }
     
-    /* Select dropdown — flatten to ONE solid pill; kill any inner nested background */
     .stSelectbox [data-baseweb="select"] div,
     [data-baseweb="popover"] div,
     div[role="listbox"] div {
@@ -126,7 +120,6 @@ st.markdown("""
         fill: #2D3748 !important;
     }
     
-    /* Widget labels */
     [data-testid="stWidgetLabel"],
     [data-testid="stWidgetLabel"] * {
         background-color: transparent !important;
@@ -139,16 +132,6 @@ st.markdown("""
         font-size: 0.95rem !important;
     }
     
-    /* Panel Container for Map & Controls */
-    .map-panel {
-        background-color: #FFFFFF;
-        border-radius: 20px;
-        padding: 24px;
-        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
-        margin-bottom: 25px;
-    }
-    
-    /* Dashboard Titles */
     .dashboard-title {
         text-align: center;
         color: #2D3748;
@@ -165,7 +148,6 @@ st.markdown("""
         margin-bottom: 20px;
     }
     
-    /* Cards */
     .metric-card {
         background-color: #FFFFFF;
         border-radius: 16px;
@@ -188,7 +170,6 @@ st.markdown("""
         box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
     }
     
-    /* Legend Color Blobs */
     .legend-item {
         display: flex;
         align-items: center;
@@ -278,84 +259,90 @@ SECTOR_COORDS = {
 }
 
 # ---------------------------------------------------------------------------
-# Data Loading (Including Current Live Data Generation)
+# Data Loading Directly from Hopsworks Feature Groups
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=1800)
 def fetch_predictions():
-    project = None
-    if HOPSWORKS_API_KEY:
+    if not HOPSWORKS_API_KEY:
+        st.error("❌ HOPSWORKS_API_KEY is missing from environment variables or secrets.")
+        return pd.DataFrame()
+        
+    try:
+        project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
+        fs = project.get_feature_store()
+        
+        # 1. Read predictions directly from the new feature group
+        pred_fg = fs.get_feature_group("aqi_sector_predictions_fg", version=1)
         try:
-            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
-            dataset_api = project.get_dataset_api()
-            dataset_api.download("Resources/sector_map_predictions.csv", local_path=str(ROOT_DIR), overwrite=True)
-        except Exception as e:
-            st.warning(f"Could not sync with Hopsworks: {e}")
+            df = pred_fg.read()
+        except Exception:
+            df = pred_fg.read(read_options={"use_hive": True})
             
-    df = pd.DataFrame()
-    if CSV_PATH.exists():
-        df = pd.read_csv(CSV_PATH)
-        df["sector_name"] = df["sector_name"].astype(str).str.strip()
-    elif Path("sector_map_predictions.csv").exists():
-        df = pd.read_csv("sector_map_predictions.csv")
         df["sector_name"] = df["sector_name"].astype(str).str.strip()
         
-    # Append "Current (Live)" horizon rows by reading the feature store
-    if project and not df.empty:
+        # 2. Append "Current (Live)" horizon rows dynamically from the base feature store
+        base_fg = fs.get_feature_group("aqi_base_lahore_fg", version=3)
         try:
-            fs = project.get_feature_store()
-            base_fg = fs.get_feature_group("aqi_base_lahore_fg", version=3)
             base_df = base_fg.read()
-            base_df["timestamp"] = pd.to_datetime(base_df["timestamp"])
-            latest_base = base_df[base_df["city"] == "Lahore"].sort_values("timestamp").tail(1)
+        except Exception:
+            base_df = base_fg.read(read_options={"use_hive": True})
             
-            if not latest_base.empty:
-                curr_time = latest_base["timestamp"].iloc[0]
-                curr_pm25 = float(latest_base["pm25"].iloc[0])
-                curr_aqi = pm25_to_aqi(curr_pm25)
+        base_df["timestamp"] = pd.to_datetime(base_df["timestamp"])
+        latest_base = base_df[base_df["city"] == "Lahore"].sort_values("timestamp").tail(1)
+        
+        if not latest_base.empty:
+            curr_time = latest_base["timestamp"].iloc[0]
+            curr_pm25 = float(latest_base["pm25"].iloc[0])
+            curr_aqi = pm25_to_aqi(curr_pm25)
+            
+            current_rows = [{
+                "target_time": str(curr_time),
+                "horizon": "Current (Live)",
+                "sector_name": "Clarity Base (City Average)",
+                "predicted_pm25": curr_pm25,
+                "predicted_aqi": curr_aqi,
+                "is_base": True
+            }]
+            
+            sector_fg = fs.get_feature_group("aqi_sector_features_fg", version=1)
+            try:
+                sector_df = sector_fg.read()
+            except Exception:
+                sector_df = sector_fg.read(read_options={"use_hive": True})
                 
-                current_rows = [{
+            sector_df["timestamp"] = pd.to_datetime(sector_df["timestamp"])
+            
+            merged_hist = pd.merge(
+                sector_df,
+                base_df[["timestamp", "pm25"]].rename(columns={"pm25": "base_pm25"}),
+                on="timestamp",
+                how="inner"
+            )
+            merged_hist["historical_offset"] = merged_hist["sector_pm25"] - merged_hist["base_pm25"]
+            curr_month = curr_time.month
+            offset_lookup = merged_hist.groupby(["sector_name", "month"])["historical_offset"].mean().to_dict()
+            unique_sectors = sector_df["sector_name"].unique()
+            
+            for sector in unique_sectors:
+                sector_offset = offset_lookup.get((sector, curr_month), 0.0)
+                final_pm25 = max(0.0, curr_pm25 + sector_offset)
+                final_aqi = pm25_to_aqi(final_pm25)
+                current_rows.append({
                     "target_time": str(curr_time),
                     "horizon": "Current (Live)",
-                    "sector_name": "Clarity Base (City Average)",
-                    "predicted_pm25": curr_pm25,
-                    "predicted_aqi": curr_aqi,
-                    "is_base": True
-                }]
-                
-                sector_fg = fs.get_feature_group("aqi_sector_features_fg", version=1)
-                sector_df = sector_fg.read()
-                sector_df["timestamp"] = pd.to_datetime(sector_df["timestamp"])
-                
-                merged_hist = pd.merge(
-                    sector_df,
-                    base_df[["timestamp", "pm25"]].rename(columns={"pm25": "base_pm25"}),
-                    on="timestamp",
-                    how="inner"
-                )
-                merged_hist["historical_offset"] = merged_hist["sector_pm25"] - merged_hist["base_pm25"]
-                curr_month = curr_time.month
-                offset_lookup = merged_hist.groupby(["sector_name", "month"])["historical_offset"].mean().to_dict()
-                unique_sectors = sector_df["sector_name"].unique()
-                
-                for sector in unique_sectors:
-                    sector_offset = offset_lookup.get((sector, curr_month), 0.0)
-                    final_pm25 = max(0.0, curr_pm25 + sector_offset)
-                    final_aqi = pm25_to_aqi(final_pm25)
-                    current_rows.append({
-                        "target_time": str(curr_time),
-                        "horizon": "Current (Live)",
-                        "sector_name": sector,
-                        "predicted_pm25": final_pm25,
-                        "predicted_aqi": final_aqi,
-                        "is_base": False
-                    })
-                
-                df_curr = pd.DataFrame(current_rows)
-                df = pd.concat([df, df_curr], ignore_index=True)
-        except Exception:
-            pass
+                    "sector_name": sector,
+                    "predicted_pm25": final_pm25,
+                    "predicted_aqi": final_aqi,
+                    "is_base": False
+                })
             
-    return df
+            df_curr = pd.DataFrame(current_rows)
+            df = pd.concat([df, df_curr], ignore_index=True)
+            
+        return df
+    except Exception as e:
+        st.error(f"❌ Failed to fetch predictions from Hopsworks Feature Store: {e}")
+        return pd.DataFrame()
 
 # ---------------------------------------------------------------------------
 # Header & Horizon Selector
@@ -366,7 +353,7 @@ st.markdown("<div class='dashboard-subtitle'>Real time air quality forecasting a
 df_all = fetch_predictions()
 
 if df_all.empty:
-    st.error("Prediction dataset unavailable. Please run batch_inference.py.")
+    st.error("Prediction feature group unavailable or empty in Hopsworks.")
     st.stop()
 
 # Horizon Selector Radio Buttons (Default to Current Live)

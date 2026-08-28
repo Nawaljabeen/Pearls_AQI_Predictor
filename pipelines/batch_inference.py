@@ -5,7 +5,7 @@ pipelines/batch_inference.py
 2. Predicts city-wide base PM2.5 for 24h, 48h, and 72h horizons.
 3. Computes historical monthly mean offsets and applies them to all 19 sectors.
 4. Calculates standard US EPA AQI scores for every prediction.
-5. Saves the multi-horizon dataset to Hopsworks Datasets for Streamlit.
+5. Pushes predictions directly to a Hopsworks Feature Group for Streamlit.
 """
 
 import os
@@ -23,6 +23,8 @@ FEATURE_GROUP_NAME = "aqi_base_lahore_fg"
 FEATURE_GROUP_VERSION = 3  
 SECTOR_FG_NAME = "aqi_sector_features_fg"
 SECTOR_FG_VERSION = 1
+PRED_FG_NAME = "aqi_sector_predictions_fg"
+PRED_FG_VERSION = 1
 
 BASE_MODEL_VERSION = 5
 
@@ -143,13 +145,20 @@ def run_inference():
 
     preds_df = pd.DataFrame(all_predictions)
     
-    # 4. Save and Upload to Hopsworks
-    local_path = "sector_map_predictions.csv"
-    preds_df.to_csv(local_path, index=False)
+    # 4. Push predictions directly to a Hopsworks Feature Group
+    print("Uploading predictions to Hopsworks Feature Store...")
+    pred_fg = fs.get_get_or_create_feature_group if hasattr(fs, "get_get_or_create_feature_group") else fs.get_or_create_feature_group
     
-    dataset_api = project.get_dataset_api()
-    dataset_api.upload(local_path, "Resources", overwrite=True)
-    print("✅ Multi-horizon predictions with AQI uploaded successfully!")
+    pred_fg = fs.get_or_create_feature_group(
+        name=PRED_FG_NAME,
+        version=PRED_FG_VERSION,
+        primary_key=["target_time", "horizon", "sector_name"],
+        event_time="target_time",
+        description="Multi-horizon AQI predictions for Lahore sectors.",
+        time_travel_format="HUDI",
+    )
+    pred_fg.insert(preds_df, write_options={"use_spark": False})
+    print("✅ Multi-horizon predictions uploaded to Hopsworks Feature Group successfully!")
 
 if __name__ == "__main__":
     run_inference()
