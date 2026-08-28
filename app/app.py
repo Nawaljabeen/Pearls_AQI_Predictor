@@ -259,7 +259,7 @@ SECTOR_COORDS = {
 }
 
 # ---------------------------------------------------------------------------
-# Data Loading Directly from Hopsworks Feature Groups
+# Data Loading Directly from Hopsworks Feature Groups (No CSVs)
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=1800)
 def fetch_predictions():
@@ -271,7 +271,7 @@ def fetch_predictions():
         project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
         fs = project.get_feature_store()
         
-        # 1. Read predictions directly from the new feature group
+        # 1. Read predictions directly from the Feature Group
         pred_fg = fs.get_feature_group("aqi_sector_predictions_fg", version=1)
         try:
             df = pred_fg.read()
@@ -363,7 +363,8 @@ with c_rad:
         "Select Prediction Horizon", 
         ["Current (Live)", "24h", "48h", "72h"], 
         horizontal=True,
-        index=0
+        index=0,
+        key="horizon_selector"
     )
 st.write("")
 
@@ -374,14 +375,21 @@ df = df_all[df_all["horizon"] == selected_horizon].copy()
 # ---------------------------------------------------------------------------
 top_col1, top_col2 = st.columns([1, 1])
 
-sector_list = list(df["sector_name"].unique())
+# Sorted sector list to maintain consistent alphabetical order across horizons
+sector_list = sorted(list(df["sector_name"].unique()))
 
 with top_col1:
     st.markdown("<div style='font-size: 0.9rem; font-weight: 700; color: transparent; margin-bottom: 6px;'>&nbsp;</div>", unsafe_allow_html=True)
 
     spotlight_placeholder = st.empty()
 
-    selected_sector = st.selectbox("Select Location Neighborhood:", sector_list, index=0)
+    # Stable selectbox with a fixed key so user selection is preserved across horizon changes
+    selected_sector = st.selectbox(
+        "Select Location Neighborhood:", 
+        sector_list, 
+        index=0, 
+        key="neighborhood_selector"
+    )
 
     selected_row = df[df["sector_name"] == selected_sector].iloc[0]
     category, accent_color, bg_pastel, border_color, img_name, health_advice = get_aqi_details(selected_row["predicted_aqi"])
