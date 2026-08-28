@@ -59,7 +59,7 @@ def fill_aqi_gaps(aqi_df, max_gap_hours=12):
 def merge_aqi_weather(aqi_df, weather_df):
     if aqi_df.empty or weather_df.empty:
         return pd.DataFrame()
-    merged = pd.merge(aqi_df, weather_df, on=["city", "timestamp"], how="inner")
+    merged = pd.merge(aqi_df, weather_df, on=["city", "timestamp"], how="left")
     return merged
 
 
