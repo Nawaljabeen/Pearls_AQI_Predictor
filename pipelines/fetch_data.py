@@ -148,7 +148,7 @@ def fetch_city_base_aqi(city_name, datetime_from, datetime_to, include_dead_stat
 
 
 def fetch_openmeteo_history(city_name, lat, lng, start_date, end_date):
-    url = "https://archive-api.open-meteo.com/v1/archive"
+    url = "https://archive-api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lng,
