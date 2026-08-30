@@ -5,16 +5,21 @@ Exploratory Data Analysis on the Lahore base AQI feature group.
 Run this locally (needs your .env with HOPSWORKS_API_KEY set).
 
 Produces:
-  - Summary stats (row counts, missingness, source breakdown)
-  - Full PM2.5 time series plot (with live/dead/interpolated coloring)
+  - Summary stats (row counts, missingness)
+  - Full PM2.5 time series plot (colored by interpolated vs measured)
   - Monthly average PM2.5 (seasonality check)
   - Hour-of-day and day-of-week average PM2.5
   - PM2.5 distribution histogram
-  - Correlation heatmap (weather features vs pm25)
+  - Correlation heatmap (weather + engineered features vs pm25)
   - Lag feature sanity check (pm25_lag_24h vs actual pm25)
   - Target horizon comparison (24h/48h/72h)
 
 All plots saved to eda/output/ as PNGs, plus a printed text summary.
+
+Note: the dead/StateAir station and its "source" column were removed from
+the pipeline (Clarity is the only feed now), so the old live-vs-dead
+source breakdown and sensor-bias comparison no longer apply and have been
+dropped from this script.
 """
 
 import os
@@ -30,7 +35,7 @@ load_dotenv()
 
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 FEATURE_GROUP_NAME = "aqi_base_lahore_fg"
-FEATURE_GROUP_VERSION = 3 # match whatever version your backfill actually landed in
+FEATURE_GROUP_VERSION = 5  # match whatever version your backfill actually landed in
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -38,14 +43,14 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 sns.set_theme(style="whitegrid")
 
 
-#loadin data from hopsworks
+# loading data from hopsworks
 
 def load_data():
     print("Connecting to Hopsworks...")
     project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
     fs = project.get_feature_store()
     fg = fs.get_feature_group(FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
- 
+
     print("Reading feature group...")
     try:
         df = fg.read()
@@ -58,7 +63,7 @@ def load_data():
     return df
 
 
-# Summary stats , mising vals, row counts, dead vs live vs interpolated breakdown 
+# Summary stats, missing vals, row counts
 
 
 def print_summary(df):
@@ -68,8 +73,6 @@ def print_summary(df):
     print(f"Date range: {df['timestamp'].min()}  ->  {df['timestamp'].max()}")
     print(f"Total rows: {len(df)}")
 
-    print("\n-- source breakdown --")
-    print(df["source"].value_counts())
     print(f"\n% interpolated: {100 * df['pm25_interpolated'].mean():.1f}%")
 
     print("\n-- pm25 stats --")
@@ -80,15 +83,15 @@ def print_summary(df):
 
 
 # Plots
-# recent data (Clarity) vs old (state air) plot
 
 def plot_full_timeseries(df):
     fig, ax = plt.subplots(figsize=(16, 5))
-    colors = {"live": "#2ca02c", "dead": "#1f77b4", "interpolated": "#ff7f0e", "unknown": "#999999"}
-    for source, group in df.groupby("source"):
-        ax.scatter(group["timestamp"], group["pm25"], s=2, label=source,
-                   color=colors.get(source, "#999999"), alpha=0.5)
-    ax.set_title("Lahore PM2.5 — Full Time Series (colored by source)")
+    colors = {False: "#2ca02c", True: "#ff7f0e"}
+    labels = {False: "measured", True: "interpolated/filled"}
+    for is_interp, group in df.groupby("pm25_interpolated"):
+        ax.scatter(group["timestamp"], group["pm25"], s=2, label=labels.get(is_interp, str(is_interp)),
+                   color=colors.get(is_interp, "#999999"), alpha=0.5)
+    ax.set_title("Lahore PM2.5 — Full Time Series (colored by measured vs interpolated)")
     ax.set_xlabel("Date")
     ax.set_ylabel("PM2.5 (µg/m³)")
     ax.legend(markerscale=8)
@@ -97,7 +100,7 @@ def plot_full_timeseries(df):
     plt.close()
     print("Saved 01_full_timeseries.png")
 
-#monthly seasonality to see when pm2.5 spikes
+# monthly seasonality to see when pm2.5 spikes
 def plot_monthly_seasonality(df):
     monthly = df.groupby(df["timestamp"].dt.month)["pm25"].agg(["mean", "median", "std"])
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -111,7 +114,7 @@ def plot_monthly_seasonality(df):
     plt.close()
     print("Saved 02_monthly_seasonality.png")
 
-#plot to check hourly n weekly pattern 
+# plot to check hourly n weekly pattern
 def plot_hour_and_dow(df):
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -134,7 +137,7 @@ def plot_hour_and_dow(df):
     plt.close()
     print("Saved 03_hour_dow_patterns.png")
 
-#histogram to see which vars contribute to pm2.5 so i can feature select
+# histogram to see which vars contribute to pm2.5 so i can feature select
 def plot_distribution(df):
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.hist(df["pm25"].dropna(), bins=80, color="#17becf", edgecolor="white")
@@ -146,15 +149,22 @@ def plot_distribution(df):
     plt.close()
     print("Saved 04_pm25_distribution.png")
 
-#the heatmap to check all vars relating to pm2.5 for da feature selection
+# the heatmap to check all vars relating to pm2.5 for feature selection
 def plot_correlation(df):
-    cols = ["pm25", "temperature_2m", "relative_humidity_2m", "surface_pressure",
-            "wind_speed_10m", "precipitation", "pm25_lag_24h", "pm25_roll_3h",
-            "pm25_change_rate_3h"]
+    cols = [
+        "pm25", "temperature_2m", "relative_humidity_2m", "surface_pressure",
+        "wind_speed_10m", "wind_dir_sin", "wind_dir_cos", "boundary_layer_height",
+        "precipitation", "is_smog_season",
+        "pm25_lag_1h", "pm25_lag_6h", "pm25_lag_24h", "pm25_lag_48h", "pm25_lag_168h",
+        "pm25_roll_3h", "pm25_roll_24h_mean", "pm25_roll_24h_std",
+        "pm25_change_rate_3h",
+    ]
+    cols = [c for c in cols if c in df.columns]
     corr = df[cols].corr()
 
-    fig, ax = plt.subplots(figsize=(9, 7))
-    sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", center=0, ax=ax)
+    fig, ax = plt.subplots(figsize=(13, 11))
+    sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", center=0, ax=ax,
+                annot_kws={"size": 7})
     ax.set_title("Feature Correlation Heatmap")
     plt.tight_layout()
     plt.savefig(OUTPUT_DIR / "05_correlation_heatmap.png", dpi=120)
@@ -175,7 +185,7 @@ def plot_lag_sanity_check(df):
     plt.close()
     print("Saved 06_lag_sanity_check.png")
 
-#plot to comapre 24h prediction -> 72h 
+# plot to compare 24h prediction -> 72h
 def plot_target_horizons(df):
     sample = df.sample(min(3000, len(df)), random_state=42)
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
@@ -195,127 +205,6 @@ def plot_target_horizons(df):
     plt.close()
     print("Saved 07_target_horizons.png")
 
-from pathlib import Path
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-from scipy import stats
-import seaborn as sns
-
-
-def analyze_sensor_bias(df: pd.DataFrame, output_dir: Path):
-    """Quantifies statistical distribution divergence and environmental humidity drift
-
-    between StateAir (reference-grade) and Clarity (low-cost optical) sensors.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Filter non-interpolated raw values per source
-    stateair = df[
-        (df["source"] == "dead") & (df["pm25_interpolated"] == False)
-    ]["pm25"].dropna()
-    clarity = df[(df["source"] == "live") & (df["pm25_interpolated"] == False)][
-        "pm25"
-    ].dropna()
-
-    # 2. Summary Statistics Table
-    metrics = {
-        "Metric": [
-            "Sample Count",
-            "Mean",
-            "Std Dev",
-            "Median",
-            "IQR",
-            "95th Percentile",
-        ],
-        "StateAir (Reference)": [
-            len(stateair),
-            stateair.mean(),
-            stateair.std(),
-            stateair.median(),
-            stateair.quantile(0.75) - stateair.quantile(0.25),
-            stateair.quantile(0.95),
-        ],
-        "Clarity (Optical)": [
-            len(clarity),
-            clarity.mean(),
-            clarity.std(),
-            clarity.median(),
-            clarity.quantile(0.75) - clarity.quantile(0.25),
-            clarity.quantile(0.95),
-        ],
-    }
-    stats_summary = pd.DataFrame(metrics)
-
-    print("\n" + "=" * 60)
-    print("SENSOR SOURCE STATISTICAL COMPARISON")
-    print("=" * 60)
-    print(stats_summary.to_string(index=False))
-
-    # 3. Two-Sample Kolmogorov-Smirnov Test (Distribution Similarity)
-    ks_stat, p_value = stats.ks_2samp(stateair, clarity)
-    print(f"\nKS-Test Statistic: {ks_stat:.4f} | p-value: {p_value:.4e}")
-    if p_value < 0.05:
-        print(
-            "⚠️  SIGNIFICANT DISTRIBUTION DRIFT DETECTED: Models trained on StateAir "
-            "will mis-estimate targets measured by Clarity."
-        )
-
-    # 4. Plotting Density Overlay and Humidity Interactions
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-
-    # Density Plot
-    sns.kdeplot(
-        stateair,
-        ax=axes[0],
-        label="StateAir (Reference)",
-        color="#1f77b4",
-        fill=True,
-        alpha=0.3,
-    )
-    sns.kdeplot(
-        clarity,
-        ax=axes[0],
-        label="Clarity (Optical)",
-        color="#2ca02c",
-        fill=True,
-        alpha=0.3,
-    )
-    axes[0].set_title("PM2.5 Density Overlay (StateAir vs Clarity)")
-    axes[0].set_xlabel("PM2.5 (µg/m³)")
-    axes[0].set_xlim(0, 400)
-    axes[0].legend()
-
-    # Humidity Interaction Check (Optical sensors over-read at >70% RH)
-    if "relative_humidity_2m" in df.columns:
-        df_valid = df[df["pm25_interpolated"] == False].copy()
-        df_valid["humidity_bin"] = pd.cut(
-            df_valid["relative_humidity_2m"],
-            bins=[0, 40, 65, 80, 100],
-            labels=["<40% (Dry)", "40-65% (Norm)", "65-80% (High)", ">80% (Extreme)"],
-        )
-        sns.boxplot(
-            data=df_valid,
-            x="humidity_bin",
-            y="pm25",
-            hue="source",
-            ax=axes[1],
-            palette={"dead": "#1f77b4", "live": "#2ca02c"},
-            showfliers=False,
-        )
-        axes[1].set_title("Humidity Sensitivity Check (Optical Drift)")
-        axes[1].set_xlabel("Relative Humidity Bin")
-        axes[1].set_ylabel("PM2.5 (µg/m³)")
-
-    plt.tight_layout()
-    plot_path = output_dir / "08_sensor_bias_analysis.png"
-    plt.savefig(plot_path, dpi=120)
-    plt.close()
-    print(f"\nSaved bias visualization to: {plot_path}")
-
-
-# Add to run_eda() inside eda_lahore.py:
-# analyze_sensor_bias(df, OUTPUT_DIR)
 
 def run_eda():
     df = load_data()
@@ -329,10 +218,9 @@ def run_eda():
     plot_correlation(df)
     plot_lag_sanity_check(df)
     plot_target_horizons(df)
-    analyze_sensor_bias(df, OUTPUT_DIR)
     print(f"\n✅ EDA complete. Plots saved to: {OUTPUT_DIR}")
     return df
 
-    
+
 if __name__ == "__main__":
     run_eda()
