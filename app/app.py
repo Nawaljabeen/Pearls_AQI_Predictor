@@ -1,6 +1,6 @@
 """
 app.py — Lahore Air Quality Spatial Forecast Dashboard
-Design Theme: Irasutoya Soft Pastel Aesthetic (League Spartan Typography)
+
 """
 
 import os
@@ -259,7 +259,7 @@ SECTOR_COORDS = {
 }
 
 # ---------------------------------------------------------------------------
-# Data Loading Directly from Hopsworks Feature Groups (No CSVs)
+# Data Loading Directly from Hopsworks Feature Groups 
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=1800)
 def fetch_predictions():
@@ -277,10 +277,15 @@ def fetch_predictions():
             df = pred_fg.read()
         except Exception:
             df = pred_fg.read(read_options={"use_hive": True})
-            
+
         df["sector_name"] = df["sector_name"].astype(str).str.strip()
+
+      
+        df["target_time"] = pd.to_datetime(df["target_time"])
+        latest_per_horizon = df.groupby("horizon")["target_time"].transform("max")
+        df = df[df["target_time"] == latest_per_horizon].copy()
         
-        # 2. Append "Current (Live)" horizon rows dynamically from the base feature store
+       
         base_fg = fs.get_feature_group("aqi_base_lahore_fg", version=5)
         try:
             base_df = base_fg.read()
