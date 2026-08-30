@@ -281,7 +281,7 @@ def fetch_predictions():
         df["sector_name"] = df["sector_name"].astype(str).str.strip()
         
         # 2. Append "Current (Live)" horizon rows dynamically from the base feature store
-        base_fg = fs.get_feature_group("aqi_base_lahore_fg", version=3)
+        base_fg = fs.get_feature_group("aqi_base_lahore_fg", version=5)
         try:
             base_df = base_fg.read()
         except Exception:
