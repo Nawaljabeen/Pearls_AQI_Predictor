@@ -1,11 +1,10 @@
 """
 pipelines/batch_inference.py
-
 1. Fetches base city features and sector features from Hopsworks.
 2. Predicts city-wide base PM2.5 for 24h, 48h, and 72h horizons.
 3. Computes historical monthly mean offsets and applies them to all 19 sectors.
 4. Calculates standard US EPA AQI scores for every prediction.
-5. Pushes predictions directly to a Hopsworks Feature Group for Streamlit.
+5. Pushes predictions directly back to the Hopsworks Feature Store.
 """
 
 import os
@@ -20,19 +19,22 @@ load_dotenv()
 
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 FEATURE_GROUP_NAME = "aqi_base_lahore_fg"
-FEATURE_GROUP_VERSION = 3  
+FEATURE_GROUP_VERSION = 5 
 SECTOR_FG_NAME = "aqi_sector_features_fg"
 SECTOR_FG_VERSION = 1
 PRED_FG_NAME = "aqi_sector_predictions_fg"
 PRED_FG_VERSION = 1
 
-BASE_MODEL_VERSION = 5
 
 BASE_FEATURE_COLUMNS = [
     "pm25", "temperature_2m", "relative_humidity_2m", "surface_pressure",
-    "wind_speed_10m", "precipitation", "hour", "day_of_week", "month",
+    "wind_speed_10m", "wind_dir_sin", "wind_dir_cos", "boundary_layer_height",
+    "precipitation", "hour", "day_of_week", "month",
     "hour_sin", "hour_cos", "month_sin", "month_cos", "dow_sin", "dow_cos",
-    "pm25_lag_24h", "pm25_roll_3h", "pm25_change_rate_3h", "pm25_deviation",
+    "is_smog_season",
+    "pm25_lag_1h", "pm25_lag_6h", "pm25_lag_24h", "pm25_lag_48h", "pm25_lag_168h",
+    "pm25_roll_3h", "pm25_roll_24h_mean", "pm25_roll_24h_std",
+    "pm25_change_rate_3h", "pm25_deviation",
     "rh_high_flag", "pm25_rh_interaction",
 ]
 
@@ -56,29 +58,44 @@ def pm25_to_aqi(pm25):
         return 500
     return 0
 
+
+def get_latest_model_version(mr, model_name):
+   
+    models = mr.get_models(model_name)
+    if not models:
+        raise ValueError(f"No registered models found with name '{model_name}'")
+    return max(m.version for m in models)
+
+
 def run_inference():
     print("Connecting to Hopsworks...")
     project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
     fs = project.get_feature_store()
     mr = project.get_model_registry()
 
-    # 1. Fetch Latest Base Data
+    
     print(f"Fetching latest features from {FEATURE_GROUP_NAME} v{FEATURE_GROUP_VERSION}...")
     base_fg = fs.get_feature_group(FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
     try:
         base_df = base_fg.read()
     except Exception:
         base_df = base_fg.read(read_options={"use_hive": True})
-        
+
     base_df["timestamp"] = pd.to_datetime(base_df["timestamp"])
     latest_data = base_df[base_df["city"] == "Lahore"].sort_values("timestamp").tail(1).copy()
-    
+
     if latest_data.empty:
         print("❌ No base data found in feature store.")
         return
 
     latest_data["pm25_deviation"] = latest_data["pm25"] - latest_data["pm25_roll_3h"]
     current_time = latest_data["timestamp"].iloc[0]
+
+    missing_cols = [c for c in BASE_FEATURE_COLUMNS if c not in latest_data.columns]
+    if missing_cols:
+        print(f"❌ Feature group v{FEATURE_GROUP_VERSION} is missing expected columns: {missing_cols}")
+        return
+
     X_base = latest_data[BASE_FEATURE_COLUMNS]
 
     # 2. Compute Historical Monthly Mean Offsets
@@ -87,9 +104,9 @@ def run_inference():
         sector_df = sector_fg.read()
     except Exception:
         sector_df = sector_fg.read(read_options={"use_hive": True})
-        
+
     sector_df["timestamp"] = pd.to_datetime(sector_df["timestamp"])
-    
+
     merged_hist = pd.merge(
         sector_df,
         base_df[["timestamp", "pm25"]].rename(columns={"pm25": "base_pm25"}),
@@ -100,7 +117,7 @@ def run_inference():
     offset_lookup = merged_hist.groupby(["sector_name", "month"])["historical_offset"].mean().to_dict()
     unique_sectors = sector_df["sector_name"].unique()
 
-    # 3. Predict across all horizons (24h, 48h, 72h)
+    #predict across all horizons (24h, 48h, 72h)
     horizons = {"24h": 24, "48h": 48, "72h": 72}
     all_predictions = []
 
@@ -110,8 +127,11 @@ def run_inference():
 
         model_name = f"aqi_lahore_{label}_xgboost"
         print(f"Processing {label} Horizon...")
-        
-        hw_model = mr.get_model(model_name, version=BASE_MODEL_VERSION)
+
+        model_version = get_latest_model_version(mr, model_name)
+        print(f"  using {model_name} v{model_version}")
+
+        hw_model = mr.get_model(model_name, version=model_version)
         model_dir = hw_model.download()
         base_model = joblib.load(model_dir + f"/{model_name}.pkl")
 
@@ -133,7 +153,7 @@ def run_inference():
             sector_offset = offset_lookup.get((sector, target_month), 0.0)
             final_sector_pm25 = max(0.0, base_pred + sector_offset)
             final_sector_aqi = pm25_to_aqi(final_sector_pm25)
-            
+
             all_predictions.append({
                 "target_time": target_time,
                 "horizon": label,
@@ -144,11 +164,9 @@ def run_inference():
             })
 
     preds_df = pd.DataFrame(all_predictions)
-    
-    # 4. Push predictions directly to a Hopsworks Feature Group
+
+  
     print("Uploading predictions to Hopsworks Feature Store...")
-    pred_fg = fs.get_get_or_create_feature_group if hasattr(fs, "get_get_or_create_feature_group") else fs.get_or_create_feature_group
-    
     pred_fg = fs.get_or_create_feature_group(
         name=PRED_FG_NAME,
         version=PRED_FG_VERSION,
@@ -158,7 +176,7 @@ def run_inference():
         time_travel_format="HUDI",
     )
     pred_fg.insert(preds_df, write_options={"use_spark": False})
-    print("✅ Multi-horizon predictions uploaded to Hopsworks Feature Group successfully!")
+    print(" Multi-horizon predictions uploaded to Hopsworks Feature Group successfully!")
 
 if __name__ == "__main__":
     run_inference()
