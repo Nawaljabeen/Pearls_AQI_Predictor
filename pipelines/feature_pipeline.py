@@ -232,4 +232,4 @@ if __name__ == "__main__":
     from datetime import datetime, timezone, timedelta
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=21)  
-    run_feature_pipeline(start_dt, end_dt, push=False)
+    run_feature_pipeline(start_dt, end_dt, push=True)
