@@ -361,6 +361,30 @@ if df_all.empty:
     st.error("Prediction feature group unavailable or empty in Hopsworks.")
     st.stop()
 
+# ---------------------------------------------------------------------------
+# Data Freshness Check
+# ---------------------------------------------------------------------------
+STALE_THRESHOLD_HOURS = 6
+try:
+    curr_live_row = df_all[df_all["horizon"] == "Current (Live)"].iloc[0]
+    base_ts = pd.to_datetime(curr_live_row["target_time"])
+    if base_ts.tzinfo is None:
+        base_ts = base_ts.tz_localize("UTC")
+    else:
+        base_ts = base_ts.tz_convert("UTC")
+    age_hours = (pd.Timestamp.now(tz="UTC") - base_ts).total_seconds() / 3600
+    if age_hours > STALE_THRESHOLD_HOURS:
+        st.markdown(
+            f'''
+            <div style="background-color: #fff3cd; color: black; padding: 16px; border-radius: 8px; border-left: 5px solid #ffc107; margin-bottom: 20px;">
+                ⚠️ <strong>Warning:</strong> Base sensor (Clarity) data was last updated {age_hours:.0f} hours ago. 'Current (Live)' and all forecast horizons below are based on this last available reading and may not reflect real-time conditions until the sensor resumes reporting.
+            </div>
+            ''', 
+            unsafe_allow_html=True
+        )
+except Exception:
+    pass  # Freshness check is best-effort — never block the dashboard on it.
+
 # Horizon Selector Radio Buttons (Default to Current Live)
 c_sp1, c_rad, c_sp2 = st.columns([1, 2.5, 1])
 with c_rad:
